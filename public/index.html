@@ -229,6 +229,9 @@
           entry.session_token ||
           entry.token ||
           "";
+        const sessionToken = entry.session_token || entry.sessionToken || "";
+        const idToken = entry.id_token || entry.idToken || "";
+        const refreshToken = entry.refresh_token || entry.refreshToken || "";
 
         const accountId =
           entry.account_id ||
@@ -242,7 +245,10 @@
           raw: entry,
           email,
           access_token: accessToken,
-          account_id: accountId
+          account_id: accountId,
+          session_token: sessionToken,
+          id_token: idToken,
+          refresh_token: refreshToken
         };
       }
 
@@ -329,6 +335,104 @@
         return new Date(Number(seconds) * 1000).toISOString();
       }
 
+      function toBase64Url(input) {
+        const bytes = new TextEncoder().encode(input);
+        let binary = "";
+        bytes.forEach((byte) => {
+          binary += String.fromCharCode(byte);
+        });
+        return btoa(binary)
+          .replace(/\+/g, "-")
+          .replace(/\//g, "_")
+          .replace(/=+$/g, "");
+      }
+
+      function buildSyntheticIdToken(accessPayload, email) {
+        const authPayload = accessPayload?.["https://api.openai.com/auth"] || {};
+        const header = {
+          alg: "none",
+          typ: "JWT",
+          cpa_synthetic: true
+        };
+        const payload = {
+          iat: accessPayload?.iat || Math.floor(Date.now() / 1000),
+          exp: accessPayload?.exp || Math.floor(Date.now() / 1000) + 86400,
+          "https://api.openai.com/auth": authPayload,
+          email
+        };
+
+        return `${toBase64Url(JSON.stringify(header))}.${toBase64Url(JSON.stringify(payload))}.`;
+      }
+
+      function getTokenMetadata(record) {
+        const accessPayload = parseJwtPayload(record?.access_token || "");
+        const authPayload = accessPayload?.["https://api.openai.com/auth"] || {};
+        const profilePayload = accessPayload?.["https://api.openai.com/profile"] || {};
+        const email =
+          record?.email ||
+          profilePayload.email ||
+          accessPayload.email ||
+          "";
+        const accountId =
+          record?.account_id ||
+          authPayload.chatgpt_account_id ||
+          accessPayload.account_id ||
+          accessPayload.sub ||
+          "";
+        const planType =
+          record?.plan_type ||
+          record?.chatgpt_plan_type ||
+          authPayload.chatgpt_plan_type ||
+          "";
+        const chatgptUserId =
+          record?.chatgpt_user_id ||
+          authPayload.chatgpt_user_id ||
+          authPayload.user_id ||
+          "";
+        const idToken = record?.id_token || "";
+        const syntheticIdToken = idToken || buildSyntheticIdToken(accessPayload, email);
+
+        return {
+          accessPayload,
+          authPayload,
+          profilePayload,
+          email,
+          accountId,
+          planType,
+          chatgptUserId,
+          idToken: syntheticIdToken,
+          idTokenSynthetic: !idToken
+        };
+      }
+
+      function buildCockpitLikeRecord(record) {
+        const metadata = getTokenMetadata(record);
+
+        return {
+          type: "codex",
+          account_id: metadata.accountId,
+          chatgpt_account_id: metadata.authPayload.chatgpt_account_id || metadata.accountId,
+          email: metadata.email,
+          name: metadata.email,
+          plan_type: metadata.planType,
+          chatgpt_plan_type: metadata.planType,
+          id_token: metadata.idToken,
+          id_token_synthetic: metadata.idTokenSynthetic,
+          access_token: record?.access_token || "",
+          refresh_token: record?.refresh_token || "",
+          session_token: record?.session_token || "",
+          last_refresh: record?.last_refresh || new Date().toISOString(),
+          expired: record?.expired || toIsoFromSeconds(metadata.accessPayload.exp)
+        };
+      }
+
+      function getEmailKey(email) {
+        return String(email || "")
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "_")
+          .replace(/^_+|_+$/g, "");
+      }
+
       function extractCodeFromInput(value) {
         const trimmed = String(value || "").trim();
         if (!trimmed) {
@@ -348,19 +452,14 @@
       }
 
       function normalizeSessionAsCockpitRecord(session) {
-        const accessPayload = parseJwtPayload(session?.access_token || "");
-        const accountId = session?.account_id || accessPayload.sub || "";
-        const email = session?.email || accessPayload.email || "";
+        const baseRecord = buildCockpitLikeRecord({
+          ...session,
+          last_refresh: new Date().toISOString(),
+          expired: toIsoFromSeconds(parseJwtPayload(session?.access_token || "").exp)
+        });
 
         return {
-          type: "codex",
-          id_token: "",
-          access_token: session?.access_token || "",
-          refresh_token: "",
-          account_id: accountId,
-          last_refresh: new Date().toISOString(),
-          email,
-          expired: toIsoFromSeconds(accessPayload.exp),
+          ...baseRecord,
           source: "session",
           session_index: session?.index
         };
@@ -370,75 +469,117 @@
         const cockpit = tokenData.cockpit;
 
         return {
-          ...cockpit,
-          account_id: cockpit.account_id || boundSession?.account_id || "",
-          email: cockpit.email || boundSession?.email || "",
+          ...buildCockpitLikeRecord({
+            ...boundSession,
+            ...cockpit,
+            access_token: cockpit.access_token || boundSession?.access_token || "",
+            refresh_token: cockpit.refresh_token || "",
+            id_token: cockpit.id_token || "",
+            email: cockpit.email || boundSession?.email || "",
+            account_id: cockpit.account_id || boundSession?.account_id || "",
+            last_refresh: cockpit.last_refresh,
+            expired: cockpit.expired
+          }),
           source: "oauth",
           session_index: boundSession?.index
         };
       }
 
       function toCockpitExportRecord(record) {
-        const { session_index, ...exportRecord } = record;
+        const { session_index, source, ...exportRecord } = record;
         return exportRecord;
       }
 
       function toCpaRecord(record) {
-        return {
-          type: "openai",
-          email: record.email,
-          account_id: record.account_id,
-          access_token: record.access_token,
-          refresh_token: record.refresh_token,
-          expired: record.expired,
-          last_refresh: record.last_refresh
-        };
+        const { source, session_index, ...exportRecord } = buildCockpitLikeRecord(record);
+        return exportRecord;
       }
 
-      function toSub2ApiRecord(record) {
+      function buildSub2ApiAccount(record) {
+        const metadata = getTokenMetadata(record);
+        const expiresAt = record.expired || toIsoFromSeconds(metadata.accessPayload.exp);
+        const expiresIn = expiresAt
+          ? Math.max(0, Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000))
+          : 0;
+
         return {
-          provider: "openai",
-          mode: "oauth",
-          email: record.email,
-          account_id: record.account_id,
-          token: {
-            id_token: record.id_token,
-            access_token: record.access_token,
-            refresh_token: record.refresh_token,
-            expired: record.expired,
-            last_refresh: record.last_refresh
+          name: metadata.email,
+          platform: "openai",
+          type: "oauth",
+          concurrency: 10,
+          priority: 1,
+          credentials: {
+            access_token: record.access_token || "",
+            chatgpt_account_id: metadata.authPayload.chatgpt_account_id || metadata.accountId,
+            chatgpt_user_id: metadata.chatgptUserId,
+            email: metadata.email,
+            expires_at: expiresAt,
+            expires_in: expiresIn,
+            plan_type: metadata.planType
+          },
+          extra: {
+            email: metadata.email,
+            email_key: getEmailKey(metadata.email),
+            name: metadata.email,
+            auth_provider: "openai",
+            source: "chatgpt_web_session",
+            last_refresh: record.last_refresh || new Date().toISOString()
           }
         };
       }
 
       function toNineRouterRecord(record) {
+        const metadata = getTokenMetadata(record);
+        const expiresAt = record.expired || toIsoFromSeconds(metadata.accessPayload.exp);
+        const lastRefresh = record.last_refresh || new Date().toISOString();
+        const expiresIn = expiresAt
+          ? Math.max(0, Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000))
+          : 0;
+
         return {
-          platform: "openai",
-          auth_type: "oauth",
-          account: record.email || record.account_id,
-          tokens: {
-            id_token: record.id_token,
-            access_token: record.access_token,
-            refresh_token: record.refresh_token
+          accessToken: record.access_token || "",
+          expiresAt,
+          testStatus: "active",
+          expiresIn,
+          providerSpecificData: {
+            chatgptAccountId: metadata.authPayload.chatgpt_account_id || metadata.accountId,
+            chatgptPlanType: metadata.planType
           },
-          metadata: {
-            account_id: record.account_id,
-            expired: record.expired,
-            last_refresh: record.last_refresh
-          }
+          id: metadata.accountId,
+          provider: "codex",
+          authType: "oauth",
+          name: metadata.email,
+          email: metadata.email,
+          priority: 9,
+          isActive: true,
+          createdAt: lastRefresh,
+          updatedAt: lastRefresh
         };
       }
 
       function buildOutputPayload() {
         switch (state.currentFormat) {
           case "cpa":
+            if (state.accounts.length === 1) {
+              return toCpaRecord(state.accounts[0]);
+            }
             return state.accounts.map(toCpaRecord);
           case "sub2api":
-            return state.accounts.map(toSub2ApiRecord);
+            return {
+              exported_at: new Date().toISOString(),
+              proxies: [],
+              accounts: state.accounts.map(buildSub2ApiAccount)
+            };
           case "9router":
+            if (state.accounts.length === 1) {
+              return toNineRouterRecord(state.accounts[0]);
+            }
             return state.accounts.map(toNineRouterRecord);
           case "cockpit":
           default:
+            if (state.accounts.length === 1) {
+              return toCockpitExportRecord(state.accounts[0]);
+            }
             return state.accounts.map(toCockpitExportRecord);
         }
       }
